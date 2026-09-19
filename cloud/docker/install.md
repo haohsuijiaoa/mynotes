@@ -1,4 +1,4 @@
-本章基于 Linux 系统 Ubuntu 22.04 安装，docker 版本 version 27.1.1
+本章基于 Linux 系统 Ubuntu 22.04 安装，docker 版本 version 29.6.2
 
 ## 1、基本安装
 

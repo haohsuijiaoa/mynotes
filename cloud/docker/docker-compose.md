@@ -130,6 +130,7 @@ CMD ["flask", "run", "--debug"]
 创建并编辑文件：.env
 
 ```bash
+# 主机端口映射容器端口 5000，配置于 compose.yaml 文件中
 APP_PORT=8000
 REDIS_HOST=redis
 REDIS_PORT=6379
@@ -221,3 +222,177 @@ docker compose up [--build]
 我们访问虚拟机 8000 端口
 
 ![image-20260829171503201](docker-compose.assets/image-20260829171503201.png)
+
+# 三、基础进阶
+
+在继续之前先停止您的应用
+
+```bash
+docker compose down
+```
+
+## 1，通过健康检查解决启动竞态问题
+
+更新：`compose.yaml`
+
+```bash
+services:
+	web:
+		build:
+		ports:
+			- "${APP_PORT}:5000"
+		environment:
+			- REDIS_HOST=${REDIS_HOST}
+			- REDIS_HOST=${REDIS_HOST}
+		depends_on:
+			redis:
+				condition: service_healthy
+			
+	redis:
+		image: redis:alpine
+		healthcheck:
+			test: ["CMD","redis-cli","ping"]
+			interval: 5s
+			timeout: 3s
+			retries: 5
+			start_period: 10s
+```
+
+![image-20260901114030062](docker-compose.assets/image-20260901114030062.png)
+
+```bash
+...
+...
+Container compose-demo-redis-1 Healthy
+...
+...
+```
+
+## 2，启动 Compose Watch以获取实时更新
+
+没有 Compose Watch，每次代码更改都需要停止堆栈、重建映像和重启容器。Compose Watch 通过自动同步修改文件到运行中的容器，消除了这种循环。
+
+更新 compose.yaml文件
+
+```bash
+services:
+  web:
+    build: .
+    ports:
+      - "${APP_PORT}:5000"
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: sync+restart
+          path: .
+          #这个路径路径同步于Dockerfile文件中的 WORKDIR
+          target: /code
+        - action: rebuild
+          path: requirements.txt
+
+  redis:
+    image: redis:alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+```
+
+再开一个窗口修改app.py的内容
+
+```bash
+......
+return f"Hello from Compose Watch! I have been seen {count} time(s).\n"
+...
+```
+
+直接刷新网页发现资源已自动更新，无需在重新 up 一下。
+
+## 3，持久化带有命名卷的数据
+
+每次你停止并重新开始堆栈，访问计数器都会重置为零。Redis 数据 它生活在容器内，因此当容器被移除时它会消失。一个有名的 Volume 通过将数据存储在主机上，超出容器生命周期来解决这个问题。
+
+更新 `compose.yaml`
+
+```yaml
+services:
+  web:
+    build: .
+    ports:
+      - "${APP_PORT}:5000"
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    depends_on:
+      redis:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: sync+restart
+          path: .
+          target: /code
+        - action: rebuild
+          path: requirements.txt
+
+  redis:
+    image: redis:alpine
+    volumes:
+    # redis-data 一份由 docker 管理的 命名卷，/data Redis容器里的数据目录Redis 默认会把持久化文件写到这里，比如 dump.rdb。
+    # redis-data:/data：把命名卷挂到 Redis 容器的 /data。
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+# 顶层 volumes: redis-data:：向 Compose 注册这个命名卷。不存在就创建，存在就复用。
+volumes:
+  redis-data:
+```
+
+所以容器删了没关系，数据在 `redis-data` 这个卷里。下次再启动 Redis，还挂同一个卷，数据就回来了。
+
+实际卷名命名规范通常是：`项目名_redis-data`
+
+可以用如下命令查看：
+
+```bash
+root@dev:~/testDir/compose-demo# docker volume ls
+DRIVER    VOLUME NAME
+local     compose-demo_redis-data
+```
+
+```bash
+docker compose up --watch
+```
+
+连续刷新10次页面。
+
+![image-20260919220156654](docker-compose.assets/image-20260919220156654.png)
+
+```bash
+# 移除容器，但不删除命名卷
+docker compose down
+```
+
+停用后重新启动可以发现 redis 缓存的数据没有丢失。
+
+```bash
+docker compose down -v
+# v 是 volumes（卷）的缩写
+```
+
+额外删除 Compose 文件里定义的命名卷和匿名卷，下次再启动，会创建一个新的空卷，计数器归零。
+
+再次启动计数器归1
+
+![image-20260919222245172](docker-compose.assets/image-20260919222245172.png)
+
