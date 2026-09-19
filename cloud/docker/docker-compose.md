@@ -94,7 +94,7 @@ flask
 redis
 ```
 
-创建并编辑文件：`Dockerfile`
+创建并编辑文件：`Dockerfile`：定义如何构建一个镜像
 
 ```bash
 # syntax=docker/dockerfile:1
@@ -102,7 +102,7 @@ redis
 # Build an image with the Python 3.12 image
 FROM python:3.12-alpine
 
-# Set the working directory to `/code`
+# 容器内部的一个真实目录，实际存储大概在/var/lib/docker/overlay2/.../diff/code
 WORKDIR /code
 
 # Set environment variables used by the `flask` command
@@ -118,7 +118,7 @@ COPY requirements.txt .
 # Install the Python dependencies
 RUN pip install -r requirements.txt
 
-# Copy the current directory `.` in the project to the workdir `.` in the image
+# 把构建上下文里的所有文件复制到 /code
 COPY . .
 
 EXPOSE 5000
@@ -395,4 +395,167 @@ docker compose down -v
 再次启动计数器归1
 
 ![image-20260919222245172](docker-compose.assets/image-20260919222245172.png)
+
+## 4，多个 compose 文件构建项目结构
+
+随着应用的增长，单一的维护变得越来越困难。顶层元素允许你将服务拆分到多个文件中，同时保持它们作为 同样的应用。`compose.yaml include`
+
+1，创建一个新文件 infra.yaml 并将 Redis 服务和卷迁移到其中。
+
+```yaml
+# 顶层键，表示定义了一个服务配置文件。
+services:
+  # 定义服务名称：redis，compose会为这个服务创建一个容器，默认情况下在compose的网络中其他服务可以用服务名redis来访问它
+  redis:
+    # 用 redis:alpine 这个镜像创建 Redis 容器。
+    image: redis:alpine
+    # 这是 redis 服务下的挂载配置，表示要把什么目录或卷挂到容器里。
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      # exec形式，相当于在容器里运行：redis-cli ping
+      test: ["CMD", "redis-cli", "ping"]
+      # 每5s检查一次
+      interval: 5s
+      # 单次检查最多等 3 秒。
+      timeout: 3s
+      # 连续失败 5 次后，才把容器标记为 unhealthy。
+      retries: 5
+      # 在容器刚启动的这 10 秒内，即使健康检查失败，也不会计入 retries。
+      start_period: 10s
+      
+# 顶层键，用来声明这个 Compose 项目里要用到的命名卷。
+volumes:
+  # 声明一个名叫 redis-data 的命名卷。
+  redis-data:
+```
+
+2，更新 compose.yaml 使他包含 infra.yaml。
+
+```yaml
+include:
+   - path: ./infra.yaml
+services:
+  web:
+    #表示这个服务的镜像不是直接拉去而是从 当前目录 构建，Docker 会找这个目录下的 Dockerfile，然后执行构建。
+    build: .
+    #端口映射，格式通常是 宿主机端口:容器端口
+    #${APP_PORT}，从环境变量读取，通常为同级目录下的 .env文件
+    #容器服务“web”监听的端口
+    ports:
+      - "${APP_PORT}:5000"
+    #给容器设置环境变量，web启动时能读到
+    environment:
+      #redis的服务名和端口号，这些值也通过 .env 文件读到，这样web应用就知道到哪里去连接redis
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    #定义服务启动顺序和依赖条件
+    depends_on:
+      #在 infra.yaml 文件中定义了redis服务
+      redis:
+        #不只是等待redis启动并且要通过健康状态检查
+        #也就是说，Redis 必须满足 healthcheck 里定义的 redis-cli ping 成功，状态变成 healthy 后，web 才会启动。
+        condition: service_healthy
+    #Docker Compose 的开发监视模式配置，配合 docker compose up --watch 使用。
+    develop:
+      watch:
+          #同步文件后，重启容器里的服务。
+        - action: sync+restart
+          #监视当前目录下的文件变化
+          path: .
+          #把变化同步给容器里的code目录
+          target: /code
+          #一旦它变化，就重新构建镜像。
+        - action: rebuild
+          #专门监视这个文件
+          path: requirements.txt
+```
+
+3，运行应用程序确认一切是否正常：
+
+```bash
+docker compose up --watch
+```
+
+Compose 在启动时会合并这两个文件。由于所有包含的服务共享相同的默认网络，服务仍可通过名称引用。这是一个简化的例子，但它展示了基本原理，以及如何使其更容易将复杂应用模块化为子 Compose 文件。
+
+有关多个Compose文件的操作及操作的更多信息，请参见https://docs.docker.com/compose/how-tos/multiple-compose-files/
+
+4，在继续前先停止堆栈
+
+```bash
+docker compose down
+```
+
+## 5，检查并调试你的运行栈
+
+当你的 Compose 堆栈已经完整配置好之后，你**不用停掉任何容器**，就能查看容器内部发生了什么。
+
+```bash
+docker compose config
+```
+
+![image-20260920004422880](docker-compose.assets/image-20260920004422880.png)
+
+从所有服务流式日志输出。
+
+```bash
+docker compose logs -f
+
+# 要跟踪单一服务的日志，后跟服务完整路径，例如：
+docker compose logs -f http://localhost:8000
+
+# 指定服务名跟踪日志
+docker compose logs -f web
+```
+
+![image-20260920005231436](docker-compose.assets/image-20260920005231436.png)
+
+这种方式看日志当我们通过 Ctrl + C 退出时不会影响到服务的运行。
+
+在运行中的容器中运行命令：`docker compose exec`
+
+```bash
+# docker compose exec 服务名称 要执行的命令，用来验证 Redis 相关环境变量是否已经正确传入容器。
+docker compose exec web env | grep REDIS
+```
+
+**测试 web 容器是否能用服务名作为主机名访问Redis**
+
+```bash
+docker compose exec web python -c "import redis; r = redis.Redis(host='redis'); print(r.ping())"
+```
+
+![image-20260920010322449](docker-compose.assets/image-20260920010322449.png)
+
+检查 redis 计数器的实时值：
+
+```bash
+docker compose exec redis redis-cli GET hits
+```
+
+# 关于一些提法的解释
+
+## 1，为什么官方翻译 docker compose down 用途为停止堆栈而不是停止容器？
+
+在 Docker Compose 里，一个 compose.yaml 文件定义了一组服务，比如在我们的例子中：
+
+```bash
+web服务 --》 一个容器
+redis服务 --》 一个容器
+还有网络、数据卷等资源...
+```
+
+这些资源合在一起构成一个完整的应用。Docker生态里习惯把这种由多个容器、网络、卷组成的应用单元叫做一个 **stack（堆栈）**。所以“堆栈” = 这个应用的整体运行环境。
+
+容器只是堆栈的一部分，一个堆栈可能包含多个容器，还有网络、卷等。docker compose down 不只是停止容器，他还会1）停止并删除所有容器；2）删除 Compose 创建的网络。3）默认保留命名卷（除非加 -v）
+
+## 2，持久化数据卷映射位置
+
+![image-20260919231253248](docker-compose.assets/image-20260919231253248.png)
+
+```bash
+# 实际宿主机的目录
+/var/lib/docker/volumes/<项目名>_redis-data/_data
+```
 
